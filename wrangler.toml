@@ -1,0 +1,8 @@
+name = "edgemirror"
+main = "src/index.js"
+compatibility_date = "2026-05-22"
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = true
