@@ -295,6 +295,8 @@ sudo scripts/docker-mirror-setup.sh rollback                         # restaurar
 
 Sin argumentos, el script ejecuta `apply`; si `MIRROR_HOST` / `AUTH_TOKEN` no están definidas, las pregunta en la terminal (el token se introduce oculto y no queda en el historial del shell). El repo no contiene el dominio ni el token reales.
 
+**¿La pull falla con `network is unreachable`?** El dominio del mirror resuelve a IPv6 (AAAA) pero este host no tiene ruta IPv6, así que containerd marca primero la dirección AAAA. Solución (una de ellas): desactivar IPv6 en el host (`sysctl -w net.ipv6.conf.all.disable_ipv6=1`, persistir en `/etc/sysctl.d/99-disable-ipv6.conf` y reiniciar Docker), fijar la IPv4 del dominio en `/etc/hosts`, o desactivar IPv6 para el dominio en el CDN/DNS. El script avisa de esta situación al final de `apply`.
+
 **Opción A — daemon-wide (sin protección por token).** En `/etc/docker/daemon.json`:
 
 ```json

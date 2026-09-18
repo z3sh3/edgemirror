@@ -294,6 +294,8 @@ sudo scripts/docker-mirror-setup.sh rollback                         # 回滚到
 
 不带参数直接运行即 `apply`；不传 `MIRROR_HOST` / `AUTH_TOKEN` 环境变量时，脚本会在终端交互式询问（令牌为隐藏输入，不会留在 shell 历史），仓库里不写真实域名与令牌。
 
+**拉取报 `network is unreachable`？** 说明镜像域名解析到 IPv6（AAAA），但本机没有 IPv6 路由，containerd 会先拨 AAAA 地址而失败。任选其一修复：给主机关闭 IPv6（`sysctl -w net.ipv6.conf.all.disable_ipv6=1`，写进 `/etc/sysctl.d/99-disable-ipv6.conf` 并重启 Docker）、在 `/etc/hosts` 固定该域名的 IPv4、或在 CDN/DNS 侧关闭该域名的 IPv6。脚本会在 `apply` 结束时自动检测并提示这种情况。
+
 **方式 A：整机级默认（未启用令牌保护时）。** 这是 `registry-mirrors` 模型：主机上所有 `docker pull nginx` 都会先走镜像。编辑 `/etc/docker/daemon.json`：
 
 ```json

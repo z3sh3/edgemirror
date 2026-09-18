@@ -275,8 +275,31 @@ cmd_verify() {
     log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
     log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
     log "image store; remove them there if they are no longer wanted."
-  fi
-  log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
+    fi
+    check_mirror_ipv6
+    log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
+}
+
+# The mirror is usually fronted by a CDN that publishes AAAA records. Hosts with
+# IPv6 configured but no working IPv6 route fail pulls with
+# "network is unreachable" because containerd dials the AAAA address first.
+check_mirror_ipv6() {
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v getent >/dev/null 2>&1 || return 0
+    # Only warn when the name really has AAAA records, so IPv4-only hosts stay quiet.
+    if ! getent ahostsv6 "$MIRROR_HOST" >/dev/null 2>&1; then
+        return 0
+    fi
+    if curl -6 -fsS -o /dev/null --max-time 8 "https://${MIRROR_HOST}/health" 2>/dev/null; then
+        return 0
+    fi
+    log "warning: ${MIRROR_HOST} has IPv6 (AAAA) records but this host cannot reach them."
+    log "  containerd may dial the AAAA address first and fail with \"network is unreachable\"."
+    log "  Fix one of:"
+    log "    - disable IPv6 on this host: sysctl -w net.ipv6.conf.all.disable_ipv6=1"
+    log "      (persist it in /etc/sysctl.d/99-disable-ipv6.conf, then restart docker)"
+    log "    - pin the IPv4 address of ${MIRROR_HOST} in /etc/hosts"
+    log "    - disable IPv6 for the domain in the CDN/DNS zone settings"
 }
 
 case "$COMMAND" in
