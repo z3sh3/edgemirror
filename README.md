@@ -271,6 +271,20 @@ The mirror is a Registry v2 pull-through endpoint, so Docker can use it in two w
 
 You normally do not hand-edit `~/.docker/config.json` — a single `docker login` writes it for you (Docker Desktop on macOS/Windows may store the credentials in the OS keychain instead). The contents of each file are shown in the modes below.
 
+**Recommended: run the one-click script.** `scripts/docker-mirror-setup.sh` (run as root on the Docker host) writes `/etc/containerd/certs.d/docker.io/hosts.toml` — the containerd image store supports username/password credentials natively (see [containerd #10612](https://github.com/containerd/containerd/pull/10612)) — so every docker.io image pull on this host goes through the mirror with the token, then restarts Docker. The script does **not pull images itself**; once configured it only prints manual verification steps for `docker pull nginx:latest`.
+
+The script **only supports the containerd image store** (Docker >= 25 with `"features": { "containerd-snapshotter": true }` in daemon.json). The classic image store cannot attach credentials to a token-gated mirror — Docker does not attach registry credentials to `registry-mirrors` pulls ([moby#30880](https://github.com/moby/moby/issues/30880)) — so when the requirement is not met the script **prints the reason and exits**:
+
+```bash
+sudo scripts/docker-mirror-setup.sh                                  # default apply: prompts for domain + token, configures, prints manual verification
+sudo AUTH_TOKEN=<your-token> MIRROR_HOST=<your-domain> scripts/docker-mirror-setup.sh   # optional: env vars skip the prompts
+sudo scripts/docker-mirror-setup.sh update                           # re-apply after token rotation
+sudo scripts/docker-mirror-setup.sh status                           # inspect
+sudo scripts/docker-mirror-setup.sh rollback                         # restore the default Docker Hub setup
+```
+
+Running the script without arguments is `apply`; when `MIRROR_HOST` / `AUTH_TOKEN` are not set, the script asks for them on the terminal (the token is a hidden input, so it never ends up in shell history). The repo does not contain the real domain or token.
+
 **Option A — daemon-wide default (no token protection).** That is the `registry-mirrors` model: every `docker pull nginx` on the host goes through the mirror first. Edit `/etc/docker/daemon.json`:
 
 ```json

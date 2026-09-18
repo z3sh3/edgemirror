@@ -279,6 +279,20 @@ El mirror es un endpoint Registry v2 pull-through, así que Docker puede usarlo 
 
 Normalmente no editas `~/.docker/config.json` a mano — un `docker login` lo escribe por ti (Docker Desktop en macOS/Windows puede guardar las credenciales en el llavero del sistema). Los contenidos de cada archivo están en los modos siguientes.
 
+**Recomendado: script de un solo paso.** `scripts/docker-mirror-setup.sh` (como root en el host Docker) escribe `/etc/containerd/certs.d/docker.io/hosts.toml` — el containerd image store soporta usuario/contraseña de forma nativa (ver [containerd #10612](https://github.com/containerd/containerd/pull/10612)) — así todas las pulls de imágenes docker.io pasan por el mirror con el token; después reinicia Docker. El script **no hace pull de imágenes por sí mismo**; al terminar solo imprime los pasos de verificación manual para `docker pull nginx:latest`.
+
+El script **solo soporta el containerd image store** (Docker >= 25 con `"features": { "containerd-snapshotter": true }` en daemon.json). El image store clásico no puede adjuntar credenciales a un mirror con token — Docker no adjunta credenciales a las pulls de `registry-mirrors` ([moby#30880](https://github.com/moby/moby/issues/30880)) — así que cuando no se cumple el requisito, el script **imprime el motivo y sale**:
+
+```bash
+sudo scripts/docker-mirror-setup.sh                                  # apply por defecto: pide dominio y token, configura e imprime verificación manual
+sudo AUTH_TOKEN=<tu-token> MIRROR_HOST=<tu-dominio> scripts/docker-mirror-setup.sh   # opcional: vars de entorno saltan las preguntas
+sudo scripts/docker-mirror-setup.sh update                           # reaplicar tras rotar el token
+sudo scripts/docker-mirror-setup.sh status                           # inspeccionar
+sudo scripts/docker-mirror-setup.sh rollback                         # restaurar la configuración por defecto (Docker Hub)
+```
+
+Sin argumentos, el script ejecuta `apply`; si `MIRROR_HOST` / `AUTH_TOKEN` no están definidas, las pregunta en la terminal (el token se introduce oculto y no queda en el historial del shell). El repo no contiene el dominio ni el token reales.
+
 **Opción A — daemon-wide (sin protección por token).** En `/etc/docker/daemon.json`:
 
 ```json

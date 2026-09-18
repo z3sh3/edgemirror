@@ -271,6 +271,20 @@ docker pull your-app.vercel.app/library/nginx:latest
 
 通常不需要手工改 `~/.docker/config.json`——执行一次 `docker login` 会自动写入（macOS / Windows 的 Docker Desktop 可能写入系统钥匙串）。下面的方式 A / B 给出每个文件的具体内容。
 
+**推荐：直接用一键脚本。** `scripts/docker-mirror-setup.sh`（在 Docker 主机上以 root 运行）写入 `/etc/containerd/certs.d/docker.io/hosts.toml`（containerd image store 原生支持用户名/密码凭据，见 [containerd #10612](https://github.com/containerd/containerd/pull/10612)），让本机所有 docker.io 镜像拉取都带令牌走镜像服务，然后重启 Docker。配置完成后脚本**不会自动拉取镜像**，只提示手动执行 `docker pull nginx:latest` 验证。
+
+脚本**只支持 containerd image store**（Docker ≥ 25 并在 `daemon.json` 开启 `"features": { "containerd-snapshotter": true }`）。经典 image store 无法向令牌门禁的 mirror 附加凭据——Docker 不会给 `registry-mirrors` 附加注册表凭据（[moby#30880](https://github.com/moby/moby/issues/30880)）——因此脚本检测到不满足时**会打印原因并退出**：
+
+```bash
+sudo scripts/docker-mirror-setup.sh                                  # 默认 apply：交互输入域名与令牌，配置后提示手动验证
+sudo AUTH_TOKEN=你的令牌 MIRROR_HOST=你的域名 scripts/docker-mirror-setup.sh   # 可选：环境变量跳过交互
+sudo scripts/docker-mirror-setup.sh update                           # 轮换令牌后重配
+sudo scripts/docker-mirror-setup.sh status                           # 查看状态
+sudo scripts/docker-mirror-setup.sh rollback                         # 回滚到默认（直连 Docker Hub）
+```
+
+不带参数直接运行即 `apply`；不传 `MIRROR_HOST` / `AUTH_TOKEN` 环境变量时，脚本会在终端交互式询问（令牌为隐藏输入，不会留在 shell 历史），仓库里不写真实域名与令牌。
+
 **方式 A：整机级默认（未启用令牌保护时）。** 这是 `registry-mirrors` 模型：主机上所有 `docker pull nginx` 都会先走镜像。编辑 `/etc/docker/daemon.json`：
 
 ```json
