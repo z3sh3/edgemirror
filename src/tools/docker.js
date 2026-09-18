@@ -1,5 +1,6 @@
 import { getDockerRegistryHost, getToolBaseUrl, renderToolNav } from "../navigation.js";
 import { fetchNoStore } from "../proxy-utils.js";
+import { getConfiguredToken, isAuthEnabled } from "../auth.js";
 
 /**
  * Docker Proxy Accelerator (Ultimate Edition)
@@ -36,11 +37,24 @@ const ROUTES = {
 
 const DEFAULT_UPSTREAM = "https://registry-1.docker.io";
 
+// Upstream registry tokens are fetched anonymously and cached per isolate.
+// The mirror token (the only credential our clients hold) never leaves the edge:
+// it authenticates the caller to this Worker, while the upstream registry gets
+// its own pull token generated from the challenge it sends back.
+const UPSTREAM_TOKEN_CACHE = new Map();
+const UPSTREAM_TOKEN_CACHE_TTL_FALLBACK_MS = 300 * 1000;
+
 export default {
     async fetch(request, env, ctx) {
-        const url = new URL(request.url);
+        let url;
+        try {
+            url = new URL(request.url);
+        } catch {
+            return new Response("Invalid request URL", { status: 400 });
+        }
         const userAgent = (request.headers.get('User-Agent') || "").toLowerCase();
         const workerUrl = getToolBaseUrl(request, "docker");
+        const authEnabled = isAuthEnabled(env);
 
         // 1. 处理 CORS
         if (request.method === 'OPTIONS') return new Response(null, PREFLIGHT_INIT);
@@ -87,7 +101,21 @@ export default {
         } else {
             // 默认为 Docker Hub，处理 Token 和 Library 补全
             if (url.pathname.includes('/token')) {
-                const tokenUrl = new URL("https://auth.docker.io" + url.pathname + url.search);
+                // Auth enabled: the client already proved it holds the mirror
+                // token at the router gate (Basic auth from `docker login`). Hand
+                // back the same token so every follow-up /v2 request carries a
+                // credential the edge can verify, without ever sending it to an
+                // upstream registry.
+                if (authEnabled) {
+                    return syntheticTokenResponse(env);
+                }
+
+                let tokenUrl;
+                try {
+                    tokenUrl = new URL("https://auth.docker.io" + url.pathname + url.search);
+                } catch {
+                    return new Response("Invalid token URL", { status: 400 });
+                }
                 const scope = tokenUrl.searchParams.get('scope');
                 // 自动补全 library 权限 (pull nginx -> pull library/nginx)
                 if (scope) {
@@ -109,21 +137,40 @@ export default {
         }
 
         // 6. 构造上游请求
-        const newUrl = new URL(upstream + url.pathname + url.search);
+        let newUrl;
+        try {
+            newUrl = new URL(upstream + url.pathname + url.search);
+        } catch {
+            return new Response("Invalid upstream URL", { status: 400 });
+        }
         const newHeaders = new Headers(request.headers);
         newHeaders.set('Host', newUrl.hostname);
         newHeaders.set('Referer', newUrl.origin);
         newHeaders.set('Connection', 'keep-alive'); 
 
-        const newRequest = new Request(newUrl, {
+        // Read the body once so a token-challenge retry can reuse it.
+        const requestBody = request.method !== 'GET' && request.method !== 'HEAD' ? await request.blob() : null;
+        const buildUpstreamRequest = () => new Request(newUrl, {
             method: request.method,
             headers: newHeaders,
-            body: request.method !== 'GET' && request.method !== 'HEAD' ? await request.blob() : null,
+            body: requestBody,
             redirect: 'manual' // 手动处理重定向
         });
 
         // 7. 发起请求
-        const response = await fetchNoStore(newRequest);
+        let response = await fetchNoStore(buildUpstreamRequest());
+
+        // Auth mode: when the upstream answers 401 with a Bearer realm, fetch an
+        // anonymous token for that exact scope and retry once. The client token is
+        // never forwarded upstream; it only ever proves the caller to this Worker.
+        if (authEnabled && response.status === 401) {
+            const upstreamToken = await fetchUpstreamToken(response);
+            if (upstreamToken) {
+                newHeaders.set('Authorization', `Bearer ${upstreamToken}`);
+                response = await fetchNoStore(buildUpstreamRequest());
+            }
+        }
+
         const responseHeaders = new Headers(response.headers);
         const status = response.status;
 
@@ -150,6 +197,79 @@ export default {
         });
     }
 };
+
+// -----------------------------------------------------------
+// Token helpers
+// -----------------------------------------------------------
+
+function syntheticTokenResponse(env) {
+    const token = getConfiguredToken(env);
+    return new Response(JSON.stringify({
+        token,
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: 3600,
+        issued_at: new Date().toISOString(),
+    }), {
+        headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+        },
+    });
+}
+
+async function fetchUpstreamToken(challengeResponse) {
+    const challenge = parseBearerChallenge(challengeResponse.headers.get('Www-Authenticate'));
+    if (!challenge) return null;
+
+    const cacheKey = `${challenge.realm}|${challenge.service}|${challenge.scope}`;
+    const cached = UPSTREAM_TOKEN_CACHE.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.token;
+
+    try {
+        let tokenUrl;
+        try {
+            tokenUrl = new URL(challenge.realm);
+        } catch {
+            return null;
+        }
+        if (challenge.service) tokenUrl.searchParams.set('service', challenge.service);
+        if (challenge.scope) tokenUrl.searchParams.set('scope', challenge.scope);
+        tokenUrl.searchParams.set('client_id', 'edgemirror');
+        tokenUrl.searchParams.set('offline_token', 'true');
+
+        const tokenResponse = await fetchNoStore(tokenUrl.toString(), {
+            headers: { Accept: 'application/json' },
+        });
+        if (!tokenResponse.ok) return null;
+
+        const payload = await tokenResponse.json();
+        const token = payload.token || payload.access_token;
+        if (typeof token !== 'string' || token.length === 0) return null;
+
+        const expiresInSeconds = Number(payload.expires_in);
+        const ttlMs = Number.isFinite(expiresInSeconds) && expiresInSeconds > 0
+            ? Math.min(Math.max(expiresInSeconds, 30), 86400) * 1000
+            : UPSTREAM_TOKEN_CACHE_TTL_FALLBACK_MS;
+        UPSTREAM_TOKEN_CACHE.set(cacheKey, { token, expiresAt: Date.now() + ttlMs });
+        return token;
+    } catch {
+        return null;
+    }
+}
+
+function parseBearerChallenge(headerValue) {
+    if (!headerValue) return null;
+    const realm = /realm="([^"]+)"/i.exec(headerValue);
+    if (!realm) return null;
+    const service = /service="([^"]+)"/i.exec(headerValue);
+    const scope = /scope="([^"]+)"/i.exec(headerValue);
+    return {
+        realm: realm[1],
+        service: service ? service[1] : '',
+        scope: scope ? scope[1] : '',
+    };
+}
 
 // -----------------------------------------------------------
 // 现代版 UI (粒子背景 + 毛玻璃 + 导航栏)
@@ -344,6 +464,7 @@ function htmlPage(request) {
             <p><span class="badge">DOCKER</span> 默认为 Docker Hub，支持 <code>library/</code> 自动补全</p>
             <p><span class="badge">MULTI</span> 支持 <code>gcr.io</code>, <code>quay.io</code>, <code>k8s.gcr.io</code> 等前缀路由</p>
             <p><span class="badge">SECURE</span> 自动修复 AWS S3 签名与 401 认证错误</p>
+            <p><span class="badge">AUTH</span> 若网关启用了访问令牌，先执行 <code>docker login ${registryHost}</code>（用户名任意，密码填令牌）</p>
         </div>
     </div>
 

@@ -184,6 +184,13 @@ Cloudflare 会读取 `wrangler.toml`，创建 Worker，并部署到当前账户�
 
 Worker 部署成功后，可以在 Cloudflare 控制台添加一个自定义域名；也可以确认该域名属于当前 Cloudflare 账户后，把 `wrangler.custom-domain.example.toml` 里的 route 配置复制到 `wrangler.toml`。所有工具仍然使用同一套路径路由。
 
+如果需要启用访问令牌保护（见下文 [访问令牌](#访问令牌服务级保护)），请在部署该 Worker 的账户下写入 Secret 并重新部署：
+
+```bash
+wrangler secret put AUTH_TOKEN
+wrangler deploy
+```
+
 ### 部署到 Vercel
 
 点击 README 顶部的 Vercel 按钮，或直接打开：
@@ -193,6 +200,8 @@ https://vercel.com/new/clone?repository-url=https://github.com/tianrking/edgemir
 ```
 
 Vercel 会使用 `api/index.js` 作为 Web Handler 函数入口，并根据 `vercel.json` 把所有路径转发到该函数。Vercel 部署使用同一套路由：`/edgemirror`、`/pypi`、`/hf`、`/github`、`/docker`、`/mirrors`、`/proxy`、`/npm`、`/go`、`/maven`、`/crates`、`/downloads`、`/help`。Docker Registry API 流量会在 `/v2`、`/token`、`/_worker_blob_proxy` 自动识别，因此单个 Vercel 域名也可以直接用于 Docker pull，不需要把 `/docker` 写进镜像名。
+
+如需在 Vercel 启用访问令牌保护，请在项目设置中添加 `AUTH_TOKEN` 环境变量（`vercel env add AUTH_TOKEN production`）并重新部署。
 
 ## 本地开发
 
@@ -215,6 +224,7 @@ npm run dev
 | `npm run smoke:canonical` | 使用受控上游验证 npm、NuGet、SDK、OCI、Git 规范路由 |
 | `npm run smoke:canonical:live` | 对代表性的规范路由执行真实官方服务验证 |
 | `npm run smoke:catalog` | 验证 48 个配置目标、OpenWrt 分界、输入校验、UI 数量与旧导航 |
+| `npm run smoke:auth` | 验证可选令牌门禁、各类携带方式、凭据清理与 Docker 令牌链路 |
 | `npm run smoke:vercel` | 导入 Vercel 函数入口并验证核心路由 |
 | `npm run verify` | 运行语法、系统源、真实上游、规范路由、Catalog、Vercel 和安全检查 |
 | `npm run deploy:cloudflare` | 使用 Wrangler 部署到 Cloudflare |
@@ -245,7 +255,83 @@ docker pull your-app.vercel.app/library/nginx:latest
 /__health
 ```
 
-健康检查会返回项目版本和已注册服务列表。
+健康检查会返回项目版本和已注册服务列表。配置了 `AUTH_TOKEN` 时，响应会额外返回 `auth: { "enabled": true }`。
+
+### 让 Docker 默认走这个代理
+
+镜像网关是一个 Registry v2 透传端点，可以用两种方式接入 Docker。
+
+**需要更新的文件清单**（按你的使用方式选择）：
+
+| 文件 | 内容 / 作用 | 何时需要 |
+| --- | --- | --- |
+| `~/.docker/config.json` | 镜像主机凭据（`docker login` 的产物，也可手工编辑 `auths` 条目） | 方式 B（令牌模式）必需 |
+| `/etc/docker/daemon.json` | `registry-mirrors`，让 `docker pull nginx` 默认走镜像 | 方式 A（未启用令牌时） |
+| `~/.bashrc` 或 `~/.zshrc` | 追加 `dp()` 别名函数，`dp nginx` 自动改写为镜像主机 | 可选（改完执行 `source ~/.bashrc` 生效） |
+
+通常不需要手工改 `~/.docker/config.json`——执行一次 `docker login` 会自动写入（macOS / Windows 的 Docker Desktop 可能写入系统钥匙串）。下面的方式 A / B 给出每个文件的具体内容。
+
+**方式 A：整机级默认（未启用令牌保护时）。** 这是 `registry-mirrors` 模型：主机上所有 `docker pull nginx` 都会先走镜像。编辑 `/etc/docker/daemon.json`：
+
+```json
+{
+  "registry-mirrors": ["https://YOUR_DOMAIN"]
+}
+```
+
+然后重启 Docker 守护进程：
+
+```bash
+sudo systemctl restart docker
+```
+
+> 注意：Docker 不会把注册表凭据附加到 `registry-mirrors` 的拉取请求上（凭据始终绑定原始注册表域名，见 [moby/moby#30880](https://github.com/moby/moby/issues/30880)）。启用令牌保护后，未认证的镜像请求会返回 `401`，Docker 会静默回退到 Docker Hub，此时镜像实际未被使用，请改用方式 B。
+
+**方式 B：登录镜像主机（与令牌保护兼容）。** 先登录一次，再使用带镜像主机名的镜像名拉取：
+
+```bash
+docker login YOUR_DOMAIN -u proxy -p <AUTH_TOKEN>
+# 用户名任意，访问令牌作为密码
+
+docker pull YOUR_DOMAIN/library/nginx:latest
+docker pull YOUR_DOMAIN/quay/coreos/etcd:latest
+```
+
+镜像链路中，边缘节点先校验你的令牌，再自己向上游注册表换取匿名拉取令牌，因此你的令牌永远不会到达 Docker Hub。
+
+脚本化环境可以用 `~/.docker/config.json` 的 `auths` 条目等价替代 `docker login`：
+
+```bash
+echo -n "proxy:<AUTH_TOKEN>" | base64
+```
+
+```json
+{
+  "auths": {
+    "YOUR_DOMAIN": {
+      "auth": "<粘贴上面的 base64 输出>"
+    }
+  }
+}
+```
+
+**让普通 `docker pull nginx` 也走镜像（令牌模式）。** 在 `~/.bashrc` 或 `~/.zshrc` 里加一个 shell 函数，自动把镜像名改写为镜像主机：
+
+```bash
+dp() {
+  local img="${1#docker.io/}"
+  case "$img" in
+    ghcr.io/*)        img="YOUR_DOMAIN/ghcr/${img#ghcr.io/}" ;;
+    quay.io/*)        img="YOUR_DOMAIN/quay/${img#quay.io/}" ;;
+    gcr.io/*)         img="YOUR_DOMAIN/gcr/${img#gcr.io/}" ;;
+    registry.k8s.io/*) img="YOUR_DOMAIN/k8s/${img#registry.k8s.io/}" ;;
+    *)                img="YOUR_DOMAIN/library/${img}" ;;
+  esac
+  docker pull "$img"
+}
+```
+
+之后 `dp nginx:latest` 就会走镜像拉取；不带斜杠的单名镜像 Docker 本身会当作 Docker Hub 镜像处理，行为不变。
 
 ## 使用示例
 
@@ -277,6 +363,7 @@ git clone https://YOUR_DOMAIN/github/vercel/next.js.git
 拉取 Docker 镜像：
 
 ```bash
+docker login YOUR_DOMAIN -u proxy -p <AUTH_TOKEN>   # 仅在启用令牌保护时需要
 docker pull YOUR_DOMAIN/library/nginx:latest
 ```
 
@@ -326,6 +413,77 @@ curl -L -O "https://YOUR_DOMAIN/downloads/node/v22.11.0/node-v22.11.0-x64.msi"
 curl -L -O "https://YOUR_DOMAIN/downloads/https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi"
 ```
 
+## 访问令牌（服务级保护）
+
+设置 `AUTH_TOKEN` Secret/环境变量后，**访问本服务的所有请求都要求携带令牌**——包括所有页面和数据路由，防止域名泄露后被大量访问。只有健康检查（`/health`、`/healthz`、`/__health`）和 `ads.txt` 跳过校验。不设置 `AUTH_TOKEN` 时行为与之前完全一致（不开启门禁）。Cloudflare 用 `wrangler secret put AUTH_TOKEN`，Vercel 用 `AUTH_TOKEN` 环境变量，见部署章节。
+
+客户端可以用四种方式携带令牌：
+
+| 携带方式 | 示例 | 典型客户端 |
+| --- | --- | --- |
+| `Authorization: Bearer <token>` | `curl -H "Authorization: Bearer $TOKEN" ...` | curl、npm、通用 HTTP |
+| `Authorization: Basic <base64>` | `curl -u "$TOKEN:x" ...` | Docker、Go、Maven、pip、浏览器登录 |
+| `X-Auth-Token: <token>` | 自定义脚本 | 通用 |
+| `?token=<token>` | `.../pypi/simple/?token=$TOKEN` | 无法设置请求头的客户端 |
+
+无论使用哪种方式，凭据都会在请求到达上游之前被剥离，`?token=` 参数也会从转发的 URL 中移除。建议优先用请求头而不是 query 参数：query 可能会出现在访问日志里。`OPTIONS` 预检请求始终放行。
+
+**浏览器访问：用户名和密码怎么填。** 打开 `https://YOUR_DOMAIN/` 后会弹出「需要验证」的登录框：
+
+- 用户名：任意值（惯例填 `proxy`）
+- 密码：访问令牌（即 `AUTH_TOKEN` 的值）
+
+校验规则是「用户名或密码等于令牌」，所以反过来（用户名=令牌、密码随便填）同样有效，多人共用同一个令牌也可以。也可以直接在地址栏输入 `https://proxy:你的令牌@YOUR_DOMAIN/`，浏览器会自动带上该凭据。勾选「记住凭据」后整站免输入，浏览器会在每次点击时自动携带，门户、帮助、Catalog 和各工具页面都能正常浏览。需要清除时，在浏览器密码管理器/站点数据中删除该站点记录即可。
+
+部署后验证门禁：
+
+```bash
+curl -s https://YOUR_DOMAIN/health   # 响应中可见 "auth": { "enabled": true }
+curl -i https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease        # 无令牌返回 401
+curl -H "Authorization: Bearer $TOKEN" https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease  # 返回 200
+```
+
+常用客户端配置：
+
+```bash
+# pip —— 在 index URL 中带凭据
+export PIP_INDEX_URL="https://proxy:YOUR_TOKEN@YOUR_DOMAIN/pypi/simple/"
+
+# npm —— 写入 ~/.npmrc
+echo 'registry=https://YOUR_DOMAIN/npm/' >> ~/.npmrc
+echo '//YOUR_DOMAIN/npm/:_authToken=YOUR_TOKEN' >> ~/.npmrc
+
+# pnpm / yarn
+pnpm config set registry https://YOUR_DOMAIN/npm/ --location global
+pnpm config set //YOUR_DOMAIN/npm/:_authToken YOUR_TOKEN
+
+# Go —— 在 GOPROXY URL 或 ~/.netrc 中带凭据
+# ~/.netrc:  machine YOUR_DOMAIN login proxy password YOUR_TOKEN
+go env -w GOPROXY=https://YOUR_DOMAIN/go,direct
+
+# Cargo —— 用令牌注册 sparse index
+cargo login --registry edgemirror YOUR_TOKEN
+# .cargo/config.toml:
+# [registries.edgemirror]
+# index = "sparse+https://YOUR_DOMAIN/crates/"
+
+# Maven —— settings.xml 服务器凭据（用户名密码自选）
+# <server><id>edgemirror</id><username>proxy</username><password>YOUR_TOKEN</password></server>
+# 仓库地址使用 https://YOUR_DOMAIN/maven/maven-central/ 并指向同一 id
+
+# 通过 GitHub 代理克隆
+git clone "https://proxy:YOUR_TOKEN@YOUR_DOMAIN/github/vercel/next.js.git"
+
+# Hugging Face —— 启用门禁后仅支持公开模型
+# （令牌会作为 Authorization 头；私有/受限仓库需要直连）
+export HF_ENDPOINT="https://YOUR_DOMAIN/hf"
+export HF_TOKEN="YOUR_TOKEN"
+
+# 通用代理
+curl -L -O -H "Authorization: Bearer $TOKEN" \
+  "https://YOUR_DOMAIN/proxy/https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi"
+```
+
 ## 项目结构
 
 ```text
@@ -361,6 +519,8 @@ wrangler.custom-domain.example.toml  可选自定义域名配置示例
 - 部署前保持 `npm run verify` 通过。
 - `/catalog` 是面向人的配置界面，`/repo`、`/pkg`、`/sdk` 是机器接口。
 - 系统源与配置接口保持只读，只允许 `GET`、`HEAD`、`OPTIONS`。
+- 启用令牌保护后，只有健康检查（与 `ads.txt`）跳过校验；所有页面和数据路由都要求有效令牌，且镜像凭据永远不会透传到上游。
+- 轮换 `AUTH_TOKEN` 时重新执行 `wrangler secret put AUTH_TOKEN`；新值部署完成后，持旧值访问会立刻被拒绝。
 - 浏览器、CDN 和上游请求保持 `no-store`，当前版本明确不启用公开缓存。
 - 保留上游 Range、ETag、Last-Modified、Content-Range、校验和与签名行为。
 - 保持 `wrangler` 更新，它是本地 Cloudflare 开发和部署工具链。

@@ -161,6 +161,13 @@ npm run deploy:cloudflare
 
 Después del despliegue puedes añadir un custom domain en Cloudflare sin cambiar el modelo de rutas.
 
+Para activar la protección por token (ver [Token de acceso](#token-de-acceso-protección-opcional)), guarda el secreto en la cuenta propietaria del deployment:
+
+```bash
+wrangler secret put AUTH_TOKEN
+wrangler deploy
+```
+
 ## Despliegue en Vercel
 
 Vercel usa `api/index.js` como Web Handler y `vercel.json` para dirigir todas las rutas a la misma función:
@@ -168,6 +175,8 @@ Vercel usa `api/index.js` como Web Handler y `vercel.json` para dirigir todas la
 ```text
 https://vercel.com/new/clone?repository-url=https://github.com/tianrking/edgemirror
 ```
+
+En Vercel, añade la variable de entorno `AUTH_TOKEN` (por ejemplo `vercel env add AUTH_TOKEN production`) y vuelve a desplegar.
 
 ## Ejemplos
 
@@ -220,9 +229,93 @@ npm run dev
 | `npm run smoke:canonical` | Verifica npm, NuGet, SDK, OCI y Git con upstreams controlados |
 | `npm run smoke:canonical:live` | Prueba rutas canónicas contra servicios oficiales reales |
 | `npm run smoke:catalog` | Verifica 48 targets, el límite OpenWrt, validación y UI |
+| `npm run smoke:auth` | Verifica el gate opcional de token, carriers, sanitización y flujo Docker |
+| `npm run smoke:vercel` | Importa la entrada Vercel y verifica rutas básicas |
 | `npm run smoke:vercel` | Verifica el entrypoint y las rutas de Vercel |
 | `npm run verify` | Ejecuta todas las pruebas anteriores y `npm audit` |
 | `npm run deploy:cloudflare` | Despliega el Worker con Wrangler |
+
+## Token de acceso (control de acceso obligatorio)
+
+Establece el secreto/variable `AUTH_TOKEN` y **todas las peticiones al servicio exigirán el token**, tanto páginas como rutas de datos, para que un dominio filtrado no abra el proxy a un uso masivo. Solo las health checks (`/health`, `/healthz`, `/__health`) y `ads.txt` se saltan el gate. Sin `AUTH_TOKEN` el comportamiento es exactamente el anterior (sin gate).
+
+Carriers aceptados:
+
+| Carrier | Ejemplo | Cliente típico |
+| --- | --- | --- |
+| `Authorization: Bearer <token>` | `curl -H "Authorization: Bearer $TOKEN" ...` | curl, npm |
+| `Authorization: Basic <base64>` | `curl -u "$TOKEN:x" ...` | Docker, Go, Maven, pip, login navegador |
+| `X-Auth-Token: <token>` | scripts propios | genérico |
+| `?token=<token>` | `.../pypi/simple/?token=$TOKEN` | clientes sin headers |
+
+La credencial siempre se elimina antes de llegar al upstream y el parámetro `?token=` se quita de la URL reenviada. Prefiere headers al query parameter (los query pueden quedar en logs). Las peticiones `OPTIONS` siempre se permiten.
+
+**Acceso desde el navegador — qué teclear en el diálogo.** Abrir `https://YOUR_DOMAIN/` muestra un diálogo «se requiere autenticación»:
+
+- Usuario: cualquier valor (por convención `proxy`)
+- Contraseña: el token de acceso (el valor de `AUTH_TOKEN`)
+
+La comprobación acepta el token en cualquiera de las dos posiciones, así que el inverso (usuario = token, contraseña = lo que sea) también funciona y varias personas pueden compartir un único token. Alternativa: escribe `https://proxy:TU_TOKEN@YOUR_DOMAIN/` en la barra de direcciones y el navegador envía las credenciales solo. Marca «recordar credenciales» para no repetirlas; el navegador las adjunta en cada clic y el portal, help, catalog y los tools funcionan con normalidad. Para borrarlas, elimina la contraseña guardada del sitio en el gestor del navegador.
+
+Verificación:
+
+```bash
+curl -s https://YOUR_DOMAIN/health   # incluye "auth": { "enabled": true }
+curl -i https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease        # 401 sin token
+curl -H "Authorization: Bearer $TOKEN" https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease  # 200
+```
+
+## Docker por defecto a través del proxy
+
+El mirror es un endpoint Registry v2 pull-through, así que Docker puede usarlo de dos maneras.
+
+**Archivos que puedes necesitar actualizar** (según el modo elegido):
+
+| Archivo | Propósito | Cuándo |
+| --- | --- | --- |
+| `~/.docker/config.json` | Credenciales del host mirror (la entrada `auths` escrita por `docker login`) | Modo B con token — requerido |
+| `/etc/docker/daemon.json` | `registry-mirrors` para que `docker pull nginx` use el mirror por defecto | Modo A sin token |
+| `~/.bashrc` o `~/.zshrc` | Helper `dp()` para que `dp nginx` se reescriba al host mirror | Opcional (`source ~/.bashrc` tras editar) |
+
+Normalmente no editas `~/.docker/config.json` a mano — un `docker login` lo escribe por ti (Docker Desktop en macOS/Windows puede guardar las credenciales en el llavero del sistema). Los contenidos de cada archivo están en los modos siguientes.
+
+**Opción A — daemon-wide (sin protección por token).** En `/etc/docker/daemon.json`:
+
+```json
+{
+  "registry-mirrors": ["https://YOUR_DOMAIN"]
+}
+```
+
+```bash
+sudo systemctl restart docker
+```
+
+> Docker no adjunta credenciales a las pulls de `registry-mirrors` (las credenciales quedan atadas al host original, [moby/moby#30880](https://github.com/moby/moby/issues/30880)); con token activado el mirror responde `401` y Docker cae a Docker Hub en silencio. Usa la Opción B con `AUTH_TOKEN`.
+
+**Opción B — login al host mirror (compatible con token).**
+
+```bash
+docker login YOUR_DOMAIN -u proxy -p <AUTH_TOKEN>   # el usuario es libre; el token es la contraseña
+docker pull YOUR_DOMAIN/library/nginx:latest
+docker pull YOUR_DOMAIN/quay/coreos/etcd:latest
+```
+
+Equivalente scriptado en `~/.docker/config.json`:
+
+```bash
+echo -n "proxy:<AUTH_TOKEN>" | base64
+```
+
+```json
+{
+  "auths": {
+    "YOUR_DOMAIN": {
+      "auth": "<base64 del comando anterior>"
+    }
+  }
+}
+```
 
 ## Estructura del proyecto
 
@@ -246,6 +339,7 @@ vercel.json                   Routing de Vercel
 - Mantén `npm run verify` en verde antes de desplegar.
 - `/catalog` es la interfaz humana; `/repo`, `/pkg` y `/sdk` son APIs de máquina.
 - Los endpoints de repositorio y configuración solo aceptan `GET`, `HEAD` y `OPTIONS`.
+- Con token activado, solo las health checks (y `ads.txt`) saltan el gate; cada página y ruta de datos exige un token válido y las credenciales del espejo nunca llegan al upstream.
 - Navegador, CDN y upstream usan `no-store`; esta versión no habilita caché pública.
 - Se conservan Range, ETag, Last-Modified, Content-Range, checksums y firmas upstream.
 - Los límites, autenticación y términos de cada servicio upstream siguen aplicando.

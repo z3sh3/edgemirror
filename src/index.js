@@ -18,6 +18,13 @@ import nuget from "./tools/nuget.js";
 import sdks from "./tools/sdks.js";
 import { REPOSITORY_SOURCES } from "./repositories/catalog.js";
 import { enforceNoStore } from "./proxy-utils.js";
+import {
+  authFailureResponse,
+  hasValidToken,
+  isAuthEnabled,
+  isPublicPath,
+  sanitizeAuthorizedRequest,
+} from "./auth.js";
 
 const HANDLERS = new Map([
   ["portal", portal],
@@ -54,7 +61,10 @@ export default {
 };
 
 async function routeRequest(request, env, ctx) {
-  const url = new URL(request.url);
+  const url = parseRequestUrl(request);
+  if (!url) {
+    return textResponse("Invalid request URL", { status: 400 });
+  }
 
   if (url.pathname === "/ads.txt") {
     return textResponse(`${ADS_TXT}\n`);
@@ -67,6 +77,10 @@ async function routeRequest(request, env, ctx) {
       version: PROJECT.version,
       primaryHost: PROJECT.primaryHost,
       hostname: url.hostname,
+      auth: {
+        enabled: isAuthEnabled(env),
+        docs: "https://github.com/z3sh3/edgemirror",
+      },
       tools: TOOL_DEFINITIONS.map(({ key, title, path, status, description }) => ({
         key,
         title,
@@ -86,6 +100,18 @@ async function routeRequest(request, env, ctx) {
       },
       pages: [CATALOG_DEFINITION, HELP_DEFINITION],
     });
+  }
+
+  // Token gate (opt-in via AUTH_TOKEN): while enabled, ALL access requires the
+  // token — UI pages and data routes alike — so a leaked domain name does not
+  // open the proxy to mass use. Only health probes and ads.txt (answered above)
+  // are exempt. After the token is verified, mirror credentials are stripped so
+  // they never reach an upstream.
+  if (request.method !== "OPTIONS" && isAuthEnabled(env) && !isPublicPath(url.pathname)) {
+    if (!hasValidToken(request, env)) {
+      return authFailureResponse(request);
+    }
+    request = await sanitizeAuthorizedRequest(request);
   }
 
   const firstSegment = url.pathname.split("/").filter(Boolean)[0];
@@ -131,7 +157,10 @@ async function routeRequest(request, env, ctx) {
 }
 
 function routePackageRequest(request, env, ctx) {
-  const url = new URL(request.url);
+  const url = parseRequestUrl(request);
+  if (!url) {
+    return textResponse("Invalid request URL", { status: 400 });
+  }
   const [, , adapter] = url.pathname.split("/");
 
   if (!adapter) {
@@ -156,7 +185,10 @@ function routePackageRequest(request, env, ctx) {
 }
 
 function routeCanonicalAdapter(request, prefix, key, handler, env, ctx) {
-  const url = new URL(request.url);
+  const url = parseRequestUrl(request);
+  if (!url) {
+    return textResponse("Invalid request URL", { status: 400 });
+  }
   if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) {
     return textResponse(`Unknown canonical route: ${url.pathname}`, { status: 404 });
   }
@@ -188,7 +220,10 @@ function stripToolPrefix(request, segment, contextSegment = segment) {
 }
 
 function stripPathPrefix(request, prefix, contextKey, basePath = prefix) {
-  const url = new URL(request.url);
+  const url = parseRequestUrl(request);
+  if (!url) {
+    return withToolContext(request, contextKey, basePath);
+  }
   if (url.pathname === prefix) {
     url.pathname = "/";
   } else if (url.pathname.startsWith(`${prefix}/`)) {
@@ -202,4 +237,12 @@ function withToolContext(request, segment, basePath = segment === "portal" ? "" 
   headers.set("X-EdgeMirror-Tool-Key", segment);
   headers.set("X-EdgeMirror-Base-Path", basePath);
   return new Request(request, { headers });
+}
+
+function parseRequestUrl(request) {
+  try {
+    return new URL(request.url);
+  } catch {
+    return null;
+  }
 }

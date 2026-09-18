@@ -184,6 +184,13 @@ The currently verified maintainer deployment is `https://box.w0x7ce.eu`. Persona
 
 After the Worker is deployed, add one custom domain in the Cloudflare dashboard, or copy the route block from `wrangler.custom-domain.example.toml` into `wrangler.toml` after confirming that the domain belongs to your Cloudflare account. Every tool will still use the same path model on that domain.
 
+To enable access-token protection (see [Access Token](#access-token-required-access-control)), store the secret in the account that owns the deployment, then redeploy:
+
+```bash
+wrangler secret put AUTH_TOKEN
+wrangler deploy
+```
+
 ### Deploy to Vercel
 
 Click the Vercel button at the top of this README, or open:
@@ -193,6 +200,8 @@ https://vercel.com/new/clone?repository-url=https://github.com/tianrking/edgemir
 ```
 
 Vercel uses `api/index.js` as a Web Handler function and `vercel.json` to route every path to that function. The Vercel deployment uses the same path model: `/edgemirror`, `/pypi`, `/hf`, `/github`, `/docker`, `/mirrors`, `/proxy`, `/npm`, `/go`, `/maven`, `/crates`, `/downloads`, and `/help`. Docker Registry API traffic is also auto-detected at `/v2`, `/token`, and `/_worker_blob_proxy`, so a single Vercel domain can serve Docker pulls without a `/docker` prefix in the image name.
+
+To enable access-token protection on Vercel, add the `AUTH_TOKEN` environment variable in the Vercel project settings (`vercel env add AUTH_TOKEN production`) and redeploy.
 
 ## Local Development
 
@@ -215,6 +224,7 @@ Useful scripts:
 | `npm run smoke:canonical` | Verify canonical npm, NuGet, SDK, OCI, and Git route behavior with controlled upstreams |
 | `npm run smoke:canonical:live` | Verify representative canonical routes against live official services |
 | `npm run smoke:catalog` | Verify all 48 configuration targets, the OpenWrt boundary, validation, UI counts, and legacy navigation |
+| `npm run smoke:auth` | Verify the optional token gate, accepted carriers, credential sanitization, and Docker token flow |
 | `npm run smoke:vercel` | Import the Vercel function entry and verify core routes |
 | `npm run verify` | Run every syntax, repository, live-upstream, canonical-route, Catalog, Vercel, and security check |
 | `npm run deploy:cloudflare` | Deploy with Wrangler |
@@ -245,7 +255,83 @@ Health checks are available at:
 /__health
 ```
 
-They return JSON with the project version and the registered service list.
+They return JSON with the project version and the registered service list. When `AUTH_TOKEN` is configured, the payload also reports `auth: { "enabled": true }`.
+
+### Use Docker Through the Proxy by Default
+
+The mirror is a Registry v2 pull-through endpoint, so Docker can use it in two ways.
+
+**Files you may need to update** (depends on the mode you pick):
+
+| File | Purpose | Needed when |
+| --- | --- | --- |
+| `~/.docker/config.json` | Mirror-host credentials (the `auths` entry written by `docker login`) | Mode B with token protection — required |
+| `/etc/docker/daemon.json` | `registry-mirrors` so `docker pull nginx` uses the mirror by default | Mode A without token protection |
+| `~/.bashrc` or `~/.zshrc` | `dp()` helper so `dp nginx` rewrites to the mirror host | Optional (run `source ~/.bashrc` after editing) |
+
+You normally do not hand-edit `~/.docker/config.json` — a single `docker login` writes it for you (Docker Desktop on macOS/Windows may store the credentials in the OS keychain instead). The contents of each file are shown in the modes below.
+
+**Option A — daemon-wide default (no token protection).** That is the `registry-mirrors` model: every `docker pull nginx` on the host goes through the mirror first. Edit `/etc/docker/daemon.json`:
+
+```json
+{
+  "registry-mirrors": ["https://YOUR_DOMAIN"]
+}
+```
+
+Then restart the daemon:
+
+```bash
+sudo systemctl restart docker
+```
+
+> Note: Docker does **not** attach registry credentials to `registry-mirrors` pulls (credentials stay tied to the original registry host, see [moby/moby#30880](https://github.com/moby/moby/issues/30880)). When token protection is enabled, an unauthenticated mirror pull answers `401` and Docker silently falls back to Docker Hub, so the mirror is not actually used. Prefer Option B when `AUTH_TOKEN` is set.
+
+**Option B — login to the mirror host (works with token protection).** Authenticate once, then pull with the mirror hostname in the image name:
+
+```bash
+docker login YOUR_DOMAIN -u proxy -p <AUTH_TOKEN>
+# username is arbitrary; the access token is the password
+
+docker pull YOUR_DOMAIN/library/nginx:latest
+docker pull YOUR_DOMAIN/quay/coreos/etcd:latest
+```
+
+Inside the mirror flow the edge verifies the token, then resolves an anonymous pull token from the upstream registry itself, so the token never reaches Docker Hub.
+
+For scripted environments, the `docker login` equivalent is an `auths` entry in `~/.docker/config.json`:
+
+```bash
+echo -n "proxy:<AUTH_TOKEN>" | base64
+```
+
+```json
+{
+  "auths": {
+    "YOUR_DOMAIN": {
+      "auth": "<paste base64 output>"
+    }
+  }
+}
+```
+
+**Make plain `docker pull nginx` use the mirror (token mode).** Add a small shell function to `~/.bashrc` or `~/.zshrc` so unqualified `docker pull` calls are rewritten to the mirror host:
+
+```bash
+dp() {
+  local img="${1#docker.io/}"
+  case "$img" in
+    ghcr.io/*)        img="YOUR_DOMAIN/ghcr/${img#ghcr.io/}" ;;
+    quay.io/*)        img="YOUR_DOMAIN/quay/${img#quay.io/}" ;;
+    gcr.io/*)         img="YOUR_DOMAIN/gcr/${img#gcr.io/}" ;;
+    registry.k8s.io/*) img="YOUR_DOMAIN/k8s/${img#registry.k8s.io/}" ;;
+    *)                img="YOUR_DOMAIN/library/${img}" ;;
+  esac
+  docker pull "$img"
+}
+```
+
+Then `dp nginx:latest` pulls through the mirror, and `docker pull nano` (unqualified aliases) still works because Docker treats names without a slash as Docker Hub images.
 
 ## Examples
 
@@ -277,6 +363,7 @@ git clone https://YOUR_DOMAIN/github/vercel/next.js.git
 Pull a Docker image:
 
 ```bash
+docker login YOUR_DOMAIN -u proxy -p <AUTH_TOKEN>   # only when token protection is on
 docker pull YOUR_DOMAIN/library/nginx:latest
 ```
 
@@ -326,6 +413,77 @@ curl -L -O "https://YOUR_DOMAIN/downloads/node/v22.11.0/node-v22.11.0-x64.msi"
 curl -L -O "https://YOUR_DOMAIN/downloads/https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi"
 ```
 
+## Access Token (Required Access Control)
+
+Set the `AUTH_TOKEN` secret/variable and **every request to the service requires the token** — UI pages and data routes alike — so a leaked domain name does not open the proxy to mass use. Only the health probes (`/health`, `/healthz`, `/__health`) and `ads.txt` skip the gate. Without `AUTH_TOKEN` the deployment behaves exactly as before (no gate). See the deploy sections for `wrangler secret put AUTH_TOKEN` (Cloudflare) and `AUTH_TOKEN` (Vercel).
+
+Clients may present the token in four ways:
+
+| Carrier | Example | Typical client |
+| --- | --- | --- |
+| `Authorization: Bearer <token>` | `curl -H "Authorization: Bearer $TOKEN" ...` | curl, npm, general HTTP |
+| `Authorization: Basic <base64>` | `curl -u "$TOKEN:x" ...` | Docker, Go, Maven, pip, browser login |
+| `X-Auth-Token: <token>` | custom scripts | generic |
+| `?token=<token>` | `.../pypi/simple/?token=$TOKEN` | clients that cannot set headers |
+
+Whatever carrier is used, the credential is stripped before the request reaches any upstream, and a `?token=` parameter is removed from the forwarded URL. Prefer headers over the query parameter: query strings can show up in access logs. `OPTIONS` preflight requests are always allowed.
+
+**Browser access — what to type in the login dialog.** Opening `https://YOUR_DOMAIN/` shows a “requires authentication” dialog:
+
+- Username: any value (conventionally `proxy`)
+- Password: the access token (the `AUTH_TOKEN` value)
+
+The check accepts a token in either position, so the reverse (username = token, password = anything) works too, and multiple people can share one token. Alternatively type `https://proxy:YOUR_TOKEN@YOUR_DOMAIN/` in the address bar and the browser sends the credentials automatically. Tick “remember credentials” to avoid re-entering them; the browser then attaches them on every click, so the portal, help, catalog, and all tool pages work normally. To clear them, delete the site's saved password in the browser.
+
+Verify the gate after deploying:
+
+```bash
+curl -s https://YOUR_DOMAIN/health   # payload shows "auth": { "enabled": true }
+curl -i https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease        # 401 without token
+curl -H "Authorization: Bearer $TOKEN" https://YOUR_DOMAIN/repo/debian/dists/stable/InRelease  # 200
+```
+
+Per-client setup:
+
+```bash
+# pip – credentials in the index URL
+export PIP_INDEX_URL="https://proxy:YOUR_TOKEN@YOUR_DOMAIN/pypi/simple/"
+
+# npm – .npmrc
+echo 'registry=https://YOUR_DOMAIN/npm/' >> ~/.npmrc
+echo '//YOUR_DOMAIN/npm/:_authToken=YOUR_TOKEN' >> ~/.npmrc
+
+# pnpm / yarn
+pnpm config set registry https://YOUR_DOMAIN/npm/ --location global
+pnpm config set //YOUR_DOMAIN/npm/:_authToken YOUR_TOKEN
+
+# Go – credentials in the GOPROXY URL or ~/.netrc
+# ~/.netrc:  machine YOUR_DOMAIN login proxy password YOUR_TOKEN
+go env -w GOPROXY=https://YOUR_DOMAIN/go,direct
+
+# Cargo – register the sparse index with the token
+cargo login --registry edgemirror YOUR_TOKEN
+# .cargo/config.toml:
+# [registries.edgemirror]
+# index = "sparse+https://YOUR_DOMAIN/crates/"
+
+# Maven – settings.xml server credentials (username password pair of your choice)
+# <server><id>edgemirror</id><username>proxy</username><password>YOUR_TOKEN</password></server>
+# then use https://YOUR_DOMAIN/maven/maven-central/ with the same id
+
+# git clone through the GitHub proxy
+GIT_TERMINAL_PROMPT=0 git clone "https://proxy:YOUR_TOKEN@YOUR_DOMAIN/github/vercel/next.js.git"
+
+# Hugging Face – public models only when the gate is on
+# (the token becomes the Authorization header; private/gated repos need a direct connection)
+export HF_ENDPOINT="https://YOUR_DOMAIN/hf"
+export HF_TOKEN="YOUR_TOKEN"
+
+# Universal proxy
+curl -L -O -H "Authorization: Bearer $TOKEN" \
+  "https://YOUR_DOMAIN/proxy/https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi"
+```
+
 ## Project Layout
 
 ```text
@@ -360,7 +518,9 @@ For Cloudflare custom domains, add the domain in the Cloudflare dashboard or use
 
 - Keep `npm run verify` green before deploying.
 - Treat `/catalog` as the human interface and `/repo`, `/pkg`, and `/sdk` as machine interfaces.
-- Keep repository and configuration endpoints read-only: only `GET`, `HEAD`, and `OPTIONS` are accepted.
+- Respect the read-only policy: repository and configuration endpoints only accept `GET`, `HEAD`, and `OPTIONS`.
+- When token protection is enabled, only health probes (and `ads.txt`) skip the gate; every page and data route requires a valid token, and mirror credentials never reach upstreams.
+- Rotate `AUTH_TOKEN` by re-running `wrangler secret put AUTH_TOKEN`; readers of the old value are rejected immediately after the deploy.
 - Keep browser, CDN, and upstream cache directives at `no-store`; public caching is deliberately not enabled.
 - Preserve upstream Range, ETag, Last-Modified, Content-Range, checksum, and signature behavior.
 - Keep `wrangler` updated; it is the local Cloudflare dev/deploy toolchain.
