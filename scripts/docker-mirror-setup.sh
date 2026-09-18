@@ -171,7 +171,12 @@ certs_files() {
 }
 
 write_certs_files() {
-  local file
+  local file basic_auth
+  # containerd hosts.toml has no username/password host keys (they are silently
+  # ignored, see containerd issue #8186), so the mirror token is sent as a static
+  # Authorization header instead. The per-host `header` table is documented in
+  # containerd's hosts.md and supported since hosts.toml was introduced (1.5).
+  basic_auth="$(printf '%s' "proxy:${AUTH_TOKEN}" | base64 | tr -d '\n')"
   while IFS= read -r file; do
     mkdir -p "$(dirname "$file")"
     cat > "$file" <<EOF
@@ -179,8 +184,9 @@ server = "https://registry-1.docker.io"
 
 [host."https://${MIRROR_HOST}"]
   capabilities = ["pull", "resolve"]
-  username = "proxy"
-  password = "${AUTH_TOKEN}"
+
+  [host."https://${MIRROR_HOST}".header]
+    authorization = "Basic ${basic_auth}"
 EOF
     log "wrote ${file}"
   done < <(certs_files)
@@ -264,6 +270,8 @@ cmd_verify() {
   if [ -f "$primary" ]; then
     log "registry config read by dockerd: ${primary}"
     grep -E '^(server|\[host\.)' "$primary" | sed 's/^/    /' || true
+    log "note: credentials are sent as a static Authorization header in that file"
+    log "(containerd hosts.toml has no username/password keys; see containerd issue #8186)."
     log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
     log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
     log "image store; remove them there if they are no longer wanted."

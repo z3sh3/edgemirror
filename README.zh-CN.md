@@ -280,7 +280,7 @@ docker pull your-app.vercel.app/library/nginx:latest
 
 通常不需要手工改 `~/.docker/config.json`——执行一次 `docker login` 会自动写入（macOS / Windows 的 Docker Desktop 可能写入系统钥匙串）。下面的方式 A / B 给出每个文件的具体内容。
 
-**推荐：直接用一键脚本。** `scripts/docker-mirror-setup.sh`（在 Docker 主机上以 root 运行）把 `hosts.toml` 写入 `/etc/docker/certs.d/docker.io/`——**dockerd 在 containerd image store 下实际读取的是这个目录**（`registry.CertsDir()`，不读 containerd 那个路径）——并同步一份到 `/etc/containerd/certs.d/docker.io/` 供 `ctr`/CRI 使用。凭据是 `hosts.toml` 原生能力（见 [containerd #10612](https://github.com/containerd/containerd/pull/10612)），因此本机所有 docker.io 拉取都会带令牌走镜像服务，随后重启 Docker。配置完成后脚本**不会自动拉取镜像**，只提示手动执行 `docker pull nginx:latest` 验证。
+**推荐：直接用一键脚本。** `scripts/docker-mirror-setup.sh`（在 Docker 主机上以 root 运行）把 `hosts.toml` 写入 `/etc/docker/certs.d/docker.io/`——**dockerd 在 containerd image store 下实际读取的是这个目录**（`registry.CertsDir()`，不读 containerd 那个路径）——并同步一份到 `/etc/containerd/certs.d/docker.io/` 供 `ctr`/CRI 使用。`hosts.toml` 并没有 `username`/`password` 字段（containerd 会静默忽略，见 [containerd #8186](https://github.com/containerd/containerd/issues/8186)），所以脚本改用官方文档支持的 [`header` 表](https://containerd.io/docs/main/hosts/)以静态 `Authorization` 头携带令牌；本机所有 docker.io 拉取都会带令牌走镜像服务，随后重启 Docker。配置完成后脚本**不会自动拉取镜像**，只提示手动执行 `docker pull nginx:latest` 验证。
 
 脚本**只支持 containerd image store**（Docker ≥ 25 并在 `daemon.json` 开启 `"features": { "containerd-snapshotter": true }`）。经典 image store 无法向令牌门禁的 mirror 附加凭据——Docker 不会给 `registry-mirrors` 附加注册表凭据（[moby#30880](https://github.com/moby/moby/issues/30880)）——因此脚本检测到不满足时**会打印原因并退出**：
 
