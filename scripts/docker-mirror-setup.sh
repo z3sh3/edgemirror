@@ -218,6 +218,17 @@ cmd_verify() {
   log "    docker pull nginx:latest"
   log "and confirm the pull resolves through ${MIRROR_HOST} (e.g. check the proxy access"
   log "log for the pull, or run the pull twice and watch the second one being cached)."
+
+  # Show what is actually in effect for the pull path: the storage driver and
+  # the containerd registry config (the daemon.json registry-mirrors list is not
+  # used by the containerd image store and is intentionally left untouched).
+  log "storage driver: $(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
+  if [ -f "$CERTS_TOML" ]; then
+    log "containerd mirror config: ${CERTS_TOML}"
+    grep -E '^(server|\[host\.)' "$CERTS_TOML" | sed 's/^/    /' || true
+    log "note: registry-mirrors left in /etc/docker/daemon.json are not used by the"
+    log "containerd image store; remove them there if they are no longer wanted."
+  fi
   log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
 }
 
