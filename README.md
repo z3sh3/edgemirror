@@ -191,6 +191,15 @@ wrangler secret put AUTH_TOKEN
 wrangler deploy
 ```
 
+**GitHub Actions deploys (recommended).** The [deploy workflow](../.github/workflows/deploy.yml) re-asserts `AUTH_TOKEN` on every push, so the secret survives redeploys (the Cloudflare dashboard Git integration instead wipes manually-set secrets on each push). Enable it by adding these to **GitHub → Settings → Secrets and variables → Actions**:
+
+- `CLOUDFLARE_API_TOKEN` — an API token with `Workers Scripts: Edit` permission (and the same account as the worker), or `CLOUDFLARE_OAUTH_TOKEN` with `Edit Cloudflare Workers` scope
+- `CLOUDFLARE_ACCOUNT_ID` — the numeric account ID of the worker
+- `AUTH_TOKEN` — the access token used by the mirror gate
+- (optional) `MIRROR_DOMAIN` repository **variable** (host without scheme) — the workflow then probes `/health` after deploy and fails if the gate is not enabled
+
+If you are already deploying through the Cloudflare dashboard Git integration, **remove that connection** (Settings → Builds & deployments) so both systems do not race on the same worker.
+
 ### Deploy to Vercel
 
 Click the Vercel button at the top of this README, or open:

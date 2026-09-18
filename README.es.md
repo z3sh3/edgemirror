@@ -168,6 +168,8 @@ wrangler secret put AUTH_TOKEN
 wrangler deploy
 ```
 
+**Recomendado: despliegue con GitHub Actions.** El [workflow de despliegue](../.github/workflows/deploy.yml) reescribe `AUTH_TOKEN` en cada push, así el secreto sobrevive a los redeploys (la integración Git del panel de Cloudflare borra los secretos manuales en cada push). Configura en **GitHub → Settings → Secrets and variables → Actions**: `CLOUDFLARE_API_TOKEN` (permiso `Workers Scripts: Edit`, misma cuenta) o `CLOUDFLARE_OAUTH_TOKEN` (scope `Edit Cloudflare Workers`), `CLOUDFLARE_ACCOUNT_ID`, y `AUTH_TOKEN`. Opcional: la variable `MIRROR_DOMAIN` (dominio sin esquema) para que el workflow verifique `/health` tras desplegar. Si usabas la integración Git del panel, elimina esa conexión (Settings → Builds & deployments) para no duplicar despliegues.
+
 ## Despliegue en Vercel
 
 Vercel usa `api/index.js` como Web Handler y `vercel.json` para dirigir todas las rutas a la misma función:

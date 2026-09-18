@@ -191,6 +191,15 @@ wrangler secret put AUTH_TOKEN
 wrangler deploy
 ```
 
+**推荐：用 GitHub Actions 部署。** [部署工作流](../.github/workflows/deploy.yml) 会在每次 push 时从 GitHub Secrets **重新写入 `AUTH_TOKEN`**，所以 Secret 不会再被重部署清掉（Cloudflare 控制台的 Git 集成反而会在每次 push 时清掉手动设置的 Secret）。配置方法——在 **GitHub → Settings → Secrets and variables → Actions** 里添加：
+
+- `CLOUDFLARE_API_TOKEN` — 具备 `Workers Scripts: Edit` 权限且属于该 Worker 所在账户的 API Token（或用 `CLOUDFLARE_OAUTH_TOKEN`，Scope 为 `Edit Cloudflare Workers`）
+- `CLOUDFLARE_ACCOUNT_ID` — Worker 所在账户的数字 ID
+- `AUTH_TOKEN` — 镜像门禁使用的访问令牌
+- （可选）`MIRROR_DOMAIN` 仓库 **Variable**（不带协议的域名）——设置后工作流会在部署后探测 `/health`，门禁未开启则失败并提示
+
+如果你之前用的是 Cloudflare 控制台的 Git 集成，请**删除该连接**（Settings → Builds & deployments），避免两个系统同时操作同一个 Worker。
+
 ### 部署到 Vercel
 
 点击 README 顶部的 Vercel 按钮，或直接打开：
