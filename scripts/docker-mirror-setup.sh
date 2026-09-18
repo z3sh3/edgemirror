@@ -8,8 +8,9 @@
 # intentionally not supported because Docker does not attach registry
 # credentials to `registry-mirrors` pulls (https://github.com/moby/moby/issues/30880),
 # so a token-gated mirror would answer 401 and Docker would silently fall back
-# to Docker Hub. If the host does not run the containerd image store, the script
-# prints the requirement and exits.
+# to Docker Hub. When the host does not run the containerd image store yet, the
+# script offers to enable "features.containerd-snapshotter" in daemon.json and
+# aborts when the operator declines.
 #
 # With the containerd image store, registry config is read from a hosts.toml
 # under the Docker certs directory (/etc/docker/certs.d/<host>/hosts.toml, the
@@ -104,7 +105,8 @@ docker_server_version() {
   docker version --format '{{.Server.Version}}' 2>/dev/null || true
 }
 
-# True when the daemon actually runs on the containerd image store.
+# True when the daemon runs on the containerd image store (driver) or is already
+# configured for it (daemon.json feature flag, effective after the next restart).
 uses_containerd_image_store() {
   local driver feature
   driver="$(docker info --format '{{.Driver}}' 2>/dev/null || true)"
@@ -115,30 +117,84 @@ uses_containerd_image_store() {
   [ "$driver" = "overlayfs" ] || [ -n "$feature" ]
 }
 
-# Gate: require the containerd image store, otherwise explain and exit.
+# Gate: require the containerd image store; offer to enable it when missing.
 require_containerd_image_store() {
-  local server_version
+  local server_version answer
   server_version="$(docker_server_version)"
 
   if [ -n "$server_version" ] && ! version_gte "$server_version" "$DOCKER_MIN_VERSION"; then
     die "Docker ${server_version} is too old: the containerd image store needs Docker >= ${DOCKER_MIN_VERSION}. Upgrade docker-ce, then re-run."
   fi
 
-  if ! uses_containerd_image_store; then
-    die "this host does not use the containerd image store, which this script requires
-
-The classic image store cannot authenticate to a token-gated mirror:
-Docker does not attach registry credentials to registry-mirrors pulls
-(https://github.com/moby/moby/issues/30880), so the proxy would answer 401
-and pulls would silently fall back to Docker Hub.
-
-To enable the containerd image store on Docker >= ${DOCKER_MIN_VERSION}, add:
-
-    \"features\": { \"containerd-snapshotter\": true }
-
-to /etc/docker/daemon.json, restart the daemon, then re-run this script.
-Note: switching image stores does not carry previously pulled images over."
+  if uses_containerd_image_store; then
+    return 0
   fi
+
+  log "this host does not use the containerd image store, which this script requires."
+  log "The classic image store cannot authenticate to a token-gated mirror: Docker does"
+  log "not attach registry credentials to registry-mirrors pulls (moby/moby#30880)."
+  log "Enabling it hides existing overlay2 images; they stay on disk."
+  read -r -p "Add \"features\": { \"containerd-snapshotter\": true } to ${DAEMON_JSON}? [y/N] " answer || die "input aborted"
+
+  case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      enable_containerd_snapshotter
+      ;;
+    *)
+      die "aborted: add \"features\": { \"containerd-snapshotter\": true } to ${DAEMON_JSON}, restart Docker, then re-run this script."
+      ;;
+  esac
+}
+
+# Add features.containerd-snapshotter to daemon.json while preserving other keys.
+# The image store switches on the Docker restart performed after the registry
+# configuration is written.
+enable_containerd_snapshotter() {
+  if [ -f "$DAEMON_JSON" ]; then
+    cp -a "$DAEMON_JSON" "${DAEMON_JSON}.edgemirror.bak"
+  else
+    printf '{}\n' > "$DAEMON_JSON"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$DAEMON_JSON" <<'PY' || die "could not update ${DAEMON_JSON}"
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        raw = handle.read().strip()
+    data = json.loads(raw) if raw else {}
+except (OSError, ValueError) as error:
+    print(f"cannot parse {path}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+features = data.get("features")
+if not isinstance(features, dict):
+    features = {}
+    data["features"] = features
+features["containerd-snapshotter"] = True
+
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+PY
+  elif command -v jq >/dev/null 2>&1; then
+    local tmp
+    tmp="$(mktemp)"
+    if ! jq '.features["containerd-snapshotter"] = true' "$DAEMON_JSON" > "$tmp"; then
+      rm -f "$tmp"
+      die "could not update ${DAEMON_JSON} with jq"
+    fi
+    mv "$tmp" "$DAEMON_JSON"
+  else
+    die "python3 or jq is required to update ${DAEMON_JSON}; add \"features\": { \"containerd-snapshotter\": true } manually and re-run this script."
+  fi
+
+  log "enabled features.containerd-snapshotter in ${DAEMON_JSON}"
+  log "backup written to ${DAEMON_JSON}.edgemirror.bak"
+  log "the image store switches on the Docker restart that follows"
 }
 
 restart_docker() {
@@ -229,7 +285,6 @@ cmd_update() {
 cmd_remove() {
   require_root
   require_docker
-  require_containerd_image_store
   local file dir
   while IFS= read -r file; do
     if [ -f "$file" ]; then
@@ -286,6 +341,13 @@ cmd_verify() {
         log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
         log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
         log "image store; remove them there if they are no longer wanted."
+    fi
+    # The daemon.json flag only takes effect after a restart; confirm it did.
+    if [ -f "$DAEMON_JSON" ] && grep -q '"containerd-snapshotter"[[:space:]]*:[[:space:]]*true' "$DAEMON_JSON" 2>/dev/null; then
+        if ! docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
+            log "warning: ${DAEMON_JSON} enables containerd-snapshotter but the daemon is not using it yet;"
+            log "  restart Docker (systemctl restart docker) and re-run this script."
+        fi
     fi
     log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
 }
