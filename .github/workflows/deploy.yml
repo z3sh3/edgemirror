@@ -11,6 +11,10 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,22 +37,23 @@ jobs:
           && npm run smoke:catalog
 
       # Deploy the code first so the Worker exists before the secret is written.
+      # env variables (including the AUTH_TOKEN secret) come from the job-level
+      # env block above.
       - name: Deploy Worker
         run: npx wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       # The Cloudflare dashboard Git integration wipes manually-set secrets on
-      # every push, so the access token is re-asserted from a GitHub Actions
-      # secret on each deployment. `wrangler secret put` reads the value from
-      # stdin and creates a new Worker version immediately afterward.
+      # every push, so the access token is re-asserted on each deployment.
+      # `wrangler secret put` reads the value from stdin and creates a new
+      # Worker version immediately. The secrets context is not allowed inside
+      # `if:` expressions, so the presence check happens in bash instead.
       - name: Set AUTH_TOKEN secret
-        if: ${{ secrets.AUTH_TOKEN != '' }}
-        run: echo "${{ secrets.AUTH_TOKEN }}" | npx wrangler secret put AUTH_TOKEN
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -n "${AUTH_TOKEN}" ]; then
+            echo "${AUTH_TOKEN}" | npx wrangler secret put AUTH_TOKEN
+          else
+            echo "AUTH_TOKEN is not configured on GitHub; skipping secret write"
+          fi
 
       # Optional runtime verification. Enable by adding a repository variable
       # MIRROR_DOMAIN (the mirror host without scheme, e.g. mirror.example.com).
@@ -61,7 +66,8 @@ jobs:
             printf '%s\n' "${health}"
             exit 1
           fi
-          code="$(curl -s -o /dev/null -w '%{http_code}' "https://${MIRROR_DOMAIN}/")"
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://${MIRROR_DOMAIN}/")"
           if [ "${code}" != "401" ]; then
             echo "expected 401 without a token, got ${code}"
             exit 1
