@@ -11,11 +11,12 @@
 # to Docker Hub. If the host does not run the containerd image store, the script
 # prints the requirement and exits.
 #
-# With the containerd image store, registry config lives in
-# /etc/containerd/certs.d/<host>/hosts.toml, which supports username/password
-# credentials natively (https://github.com/containerd/containerd/pull/10612).
-# The script writes /etc/containerd/certs.d/docker.io/hosts.toml so every image
-# pull from Docker Hub on this host goes through the mirror with the token.
+# With the containerd image store, registry config is read from a hosts.toml
+# under the Docker certs directory (/etc/docker/certs.d/<host>/hosts.toml, the
+# path moby's registry.CertsDir() resolves) and mirrored under
+# /etc/containerd/certs.d/<host>/hosts.toml for ctr/CRI consumers. The script
+# writes both so every docker.io pull on this host goes through the mirror with
+# the token.
 #
 # Usage (run as root on the Docker host):
 #   Running the script without arguments applies the mirror configuration and
@@ -45,8 +46,15 @@ MIRROR_HOST="${MIRROR_HOST:-}"
 AUTH_TOKEN="${AUTH_TOKEN:-}"
 DOCKER_MIN_VERSION="25.0.0"
 DAEMON_JSON="/etc/docker/daemon.json"
-CERTS_DIR="/etc/containerd/certs.d/docker.io"
-CERTS_TOML="${CERTS_DIR}/hosts.toml"
+# dockerd (containerd image store) resolves hosts.toml from its own certs dir
+# (moby `registry.CertsDir()`, default /etc/docker/certs.d) and does NOT read the
+# containerd path, so this is the file that actually takes effect for pulls.
+# The containerd CRI path is written as well for `ctr`/CRI consumers and for
+# future Docker versions that may read both.
+DOCKER_CERTS_ROOT="/etc/docker/certs.d"
+CONTAINERD_CERTS_ROOT="/etc/containerd/certs.d"
+# Namespaces probed for Docker Hub references across Docker and containerd versions.
+CERT_HOST_DIRS="docker.io registry-1.docker.io"
 
 # --------------------------------------------------------------- helpers ----
 log()  { printf '[docker-mirror] %s\n' "$*"; }
@@ -152,10 +160,21 @@ restart_docker() {
 }
 
 # -------------------------------------------------- containerd certs.d ---------
-apply_containerd_certs() {
-  log "writing ${CERTS_TOML}"
-  mkdir -p "$CERTS_DIR"
-  cat > "$CERTS_TOML" <<EOF
+# All hosts.toml locations this script manages (both certs roots x Hub namespaces).
+certs_files() {
+  local root host
+  for root in "$DOCKER_CERTS_ROOT" "$CONTAINERD_CERTS_ROOT"; do
+    for host in $CERT_HOST_DIRS; do
+      printf '%s/%s/hosts.toml\n' "$root" "$host"
+    done
+  done
+}
+
+write_certs_files() {
+  local file
+  while IFS= read -r file; do
+    mkdir -p "$(dirname "$file")"
+    cat > "$file" <<EOF
 server = "https://registry-1.docker.io"
 
 [host."https://${MIRROR_HOST}"]
@@ -163,6 +182,12 @@ server = "https://registry-1.docker.io"
   username = "proxy"
   password = "${AUTH_TOKEN}"
 EOF
+    log "wrote ${file}"
+  done < <(certs_files)
+}
+
+apply_containerd_certs() {
+  write_certs_files
   restart_docker
 }
 
@@ -190,9 +215,19 @@ cmd_remove() {
   require_root
   require_docker
   require_containerd_image_store
-  rm -f "$CERTS_TOML"
+  local file dir
+  while IFS= read -r file; do
+    if [ -f "$file" ]; then
+      rm -f "$file"
+      log "removed ${file}"
+    fi
+  done < <(certs_files)
+  # Drop directories that this script created and that are now empty.
+  for dir in "$DOCKER_CERTS_ROOT" "$CONTAINERD_CERTS_ROOT"; do
+    rmdir "${dir}/docker.io" "${dir}/registry-1.docker.io" "${dir}" 2>/dev/null || true
+  done
   restart_docker
-  log "removed ${CERTS_TOML}; docker.io pulls now go directly to Docker Hub"
+  log "docker.io pulls now go directly to Docker Hub again"
 }
 
 cmd_status() {
@@ -201,11 +236,14 @@ cmd_status() {
   log "storage driver: $(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
   log "server version: $(docker_server_version)"
   if uses_containerd_image_store; then
-    if [ -f "$CERTS_TOML" ]; then
-      log "containerd mirror config: ${CERTS_TOML} (present)"
-    else
-      log "containerd mirror config: ${CERTS_TOML} (missing)"
-    fi
+    local file
+    while IFS= read -r file; do
+      if [ -f "$file" ]; then
+        log "mirror config: ${file} (present)"
+      else
+        log "mirror config: ${file} (missing)"
+      fi
+    done < <(certs_files)
   else
     log "containerd image store: not used (see 'apply' command requirements)"
   fi
@@ -220,14 +258,15 @@ cmd_verify() {
   log "log for the pull, or run the pull twice and watch the second one being cached)."
 
   # Show what is actually in effect for the pull path: the storage driver and
-  # the containerd registry config (the daemon.json registry-mirrors list is not
-  # used by the containerd image store and is intentionally left untouched).
+  # the file dockerd itself reads (its own certs dir, not the containerd one).
+  local primary="${DOCKER_CERTS_ROOT}/docker.io/hosts.toml"
   log "storage driver: $(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
-  if [ -f "$CERTS_TOML" ]; then
-    log "containerd mirror config: ${CERTS_TOML}"
-    grep -E '^(server|\[host\.)' "$CERTS_TOML" | sed 's/^/    /' || true
-    log "note: registry-mirrors left in /etc/docker/daemon.json are not used by the"
-    log "containerd image store; remove them there if they are no longer wanted."
+  if [ -f "$primary" ]; then
+    log "registry config read by dockerd: ${primary}"
+    grep -E '^(server|\[host\.)' "$primary" | sed 's/^/    /' || true
+    log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
+    log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
+    log "image store; remove them there if they are no longer wanted."
   fi
   log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
 }
