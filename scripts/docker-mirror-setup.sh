@@ -174,17 +174,26 @@ write_certs_files() {
   local file basic_auth
   # containerd hosts.toml has no username/password host keys (they are silently
   # ignored, see containerd issue #8186), so the mirror token is sent as a static
-  # Authorization header instead. The per-host `header` table is documented in
-  # containerd's hosts.md and supported since hosts.toml was introduced (1.5).
+  # Authorization header via the documented `header` table.
+  #
+  # `server` points at the mirror as well: containerd uses the default server for
+  # lookups that are not covered by mirror capabilities (for example the OCI
+  # referrers API on containerd <= 2.1), and a registry-1.docker.io fallback would
+  # bypass the mirror and break on censored networks.
+  #
+  # `capabilities` is intentionally omitted: the built-in default is
+  # pull|resolve|push (plus referrers on containerd >= 2.2), while listing
+  # "referrers" explicitly is a hard "unknown capability" error on <= 2.1.
   basic_auth="$(printf '%s' "proxy:${AUTH_TOKEN}" | base64 | tr -d '\n')"
   while IFS= read -r file; do
     mkdir -p "$(dirname "$file")"
     cat > "$file" <<EOF
-server = "https://registry-1.docker.io"
+server = "https://${MIRROR_HOST}"
+
+[header]
+  authorization = "Basic ${basic_auth}"
 
 [host."https://${MIRROR_HOST}"]
-  capabilities = ["pull", "resolve"]
-
   [host."https://${MIRROR_HOST}".header]
     authorization = "Basic ${basic_auth}"
 EOF
@@ -267,14 +276,16 @@ cmd_verify() {
   # the file dockerd itself reads (its own certs dir, not the containerd one).
   local primary="${DOCKER_CERTS_ROOT}/docker.io/hosts.toml"
   log "storage driver: $(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
-  if [ -f "$primary" ]; then
-    log "registry config read by dockerd: ${primary}"
-    grep -E '^(server|\[host\.)' "$primary" | sed 's/^/    /' || true
-    log "note: credentials are sent as a static Authorization header in that file"
-    log "(containerd hosts.toml has no username/password keys; see containerd issue #8186)."
-    log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
-    log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
-    log "image store; remove them there if they are no longer wanted."
+    if [ -f "$primary" ]; then
+        log "registry config read by dockerd: ${primary}"
+        grep -E '^(server|\[host\.)' "$primary" | sed 's/^/    /' || true
+        log "note: the mirror serves as the default server too, so referrers and other"
+        log "lookups cannot fall back to a direct registry-1.docker.io connection."
+        log "note: credentials are sent as a static Authorization header in that file"
+        log "(containerd hosts.toml has no username/password keys; see containerd issue #8186)."
+        log "note: the same file is mirrored under ${CONTAINERD_CERTS_ROOT} for ctr/CRI consumers."
+        log "note: registry-mirrors left in ${DAEMON_JSON} are not used by the containerd"
+        log "image store; remove them there if they are no longer wanted."
     fi
     check_mirror_ipv6
     log "quay.io / ghcr.io / gcr.io images still need the full name: docker pull ${MIRROR_HOST}/quay/coreos/etcd:latest"
