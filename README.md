@@ -294,8 +294,6 @@ sudo scripts/docker-mirror-setup.sh rollback                         # restore t
 
 Running the script without arguments is `apply`; when `MIRROR_HOST` / `AUTH_TOKEN` are not set, the script asks for them on the terminal (the token is a hidden input, so it never ends up in shell history). The repo does not contain the real domain or token.
 
-**Pull fails with `network is unreachable`?** The mirror hostname resolves to IPv6 (AAAA) but this host has no IPv6 route, so containerd dials the AAAA address first. Fix with one of: disable IPv6 on the host (`sysctl -w net.ipv6.conf.all.disable_ipv6=1`, persist it in `/etc/sysctl.d/99-disable-ipv6.conf`, then restart Docker), pin the mirror's IPv4 address in `/etc/hosts`, or turn IPv6 off for the domain in the CDN/DNS settings.
-
 **Option A — daemon-wide default (no token protection).** That is the `registry-mirrors` model: every `docker pull nginx` on the host goes through the mirror first. Edit `/etc/docker/daemon.json`:
 
 ```json
